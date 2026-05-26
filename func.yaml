@@ -1,0 +1,6 @@
+schema_version: 20180708
+name: sectigo-certbot-renewal
+version: 0.0.13
+runtime: docker
+memory: 512
+timeout: 300
