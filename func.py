@@ -1,3 +1,8 @@
+# Copyright (c) 2026, Oracle OCI Certbot contributors
+# Licensed under the Universal Permissive License v 1.0 as shown at
+# https://oss.oracle.com/licenses/upl/
+# SPDX-License-Identifier: UPL-1.0
+
 from __future__ import annotations
 
 import hashlib
@@ -13,7 +18,7 @@ import tarfile
 import traceback
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from stat import S_IFDIR, S_IFLNK, S_IFREG
 from typing import Any
 
@@ -40,6 +45,20 @@ CONFIG_DIR_ARG = "certTemp/config"
 WORK_DIR_ARG = "certTemp/work"
 LOGS_DIR_ARG = "certTemp/logs"
 DEFAULT_SECTIGO_ACME_SERVER = "https://acme.sectigo.com/v2/DV"
+LETSENCRYPT_ACME_SERVER = "https://acme-v02.api.letsencrypt.org/directory"
+LETSENCRYPT_STAGING_ACME_SERVER = "https://acme-staging-v02.api.letsencrypt.org/directory"
+ACME_SERVER_ALIASES = {
+    "sectigo": DEFAULT_SECTIGO_ACME_SERVER,
+    "sectigo-dv": DEFAULT_SECTIGO_ACME_SERVER,
+    "letsencrypt": LETSENCRYPT_ACME_SERVER,
+    "lets-encrypt": LETSENCRYPT_ACME_SERVER,
+    "le": LETSENCRYPT_ACME_SERVER,
+    "letsencrypt-staging": LETSENCRYPT_STAGING_ACME_SERVER,
+    "lets-encrypt-staging": LETSENCRYPT_STAGING_ACME_SERVER,
+    "le-staging": LETSENCRYPT_STAGING_ACME_SERVER,
+}
+DEFAULT_MAX_STATE_ARCHIVE_BYTES = 50 * 1024 * 1024
+SECRET_ARG_OPTIONS = {"--eab-hmac-key"}
 
 
 @dataclass(frozen=True)
@@ -83,12 +102,15 @@ class CertificateBundle:
 
 
 class CertbotError(RuntimeError):
+    # Certbot debug logs can echo CLI arguments, so tails are redacted before
+    # they are returned to the caller.
     def __init__(
         self,
         exit_code: int,
         command: list[str],
         output: str | None,
         log_tail: str | None,
+        sensitive_values: list[str],
     ) -> None:
         message = (
             f"Certbot failed with exit code {exit_code}."
@@ -98,8 +120,8 @@ class CertbotError(RuntimeError):
         super().__init__(message)
         self.exit_code = exit_code
         self.command = command
-        self.output_tail = _tail(output)
-        self.log_tail = _tail(log_tail)
+        self.output_tail = _tail(_redact_text(output, sensitive_values))
+        self.log_tail = _tail(_redact_text(log_tail, sensitive_values))
 
     def response_payload(self) -> dict[str, Any]:
         return {
@@ -144,6 +166,8 @@ def run(invocation: dict[str, Any] | None = None) -> dict[str, Any]:
     )
     _migrate_legacy_state_layout()
     _ensure_certbot_directories()
+    # Imported state may come from a workstation zip. Certbot renewal files use
+    # absolute paths and live/*.pem symlinks, so normalize both before renewal.
     _repair_certbot_state()
 
     has_lineage = _has_renewal_lineage()
@@ -156,6 +180,7 @@ def run(invocation: dict[str, Any] | None = None) -> dict[str, Any]:
         certbot_args = _renew_command(config)
 
     certbot_result = _run_certbot(certbot_args, config.timeout_seconds)
+    certbot_sensitive_values = _sensitive_values_from_args(certbot_args)
     archive = _build_state_archive(config.state_object_name)
     _upload_state(
         object_storage,
@@ -175,7 +200,9 @@ def run(invocation: dict[str, Any] | None = None) -> dict[str, Any]:
         "lineages": _lineage_names(),
         "loadBalancerUpdate": load_balancer_result,
         "certbotExitCode": certbot_result.returncode,
-        "certbotOutputTail": _tail(certbot_result.stdout),
+        "certbotOutputTail": _tail(
+            _redact_text(certbot_result.stdout, certbot_sensitive_values)
+        ),
     }
 
 
@@ -334,9 +361,17 @@ def _download_state(client, namespace: str, bucket: str, object_name: str) -> bo
             return False
         raise
 
+    max_bytes = _max_state_archive_bytes()
+    content_length = _response_content_length(response)
+    if content_length is not None and content_length > max_bytes:
+        raise ValueError(
+            f"State archive is too large: {content_length} bytes exceeds {max_bytes}."
+        )
+
     payload = response.data.content
     if not payload:
         return False
+    _enforce_state_archive_size(len(payload), "Downloaded state archive")
 
     if object_name.endswith(".zip"):
         _extract_state_zip(payload)
@@ -347,6 +382,34 @@ def _download_state(client, namespace: str, bucket: str, object_name: str) -> bo
     return True
 
 
+def _response_content_length(response) -> int | None:
+    headers = getattr(response, "headers", None) or {}
+    value = headers.get("content-length") or headers.get("Content-Length")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _max_state_archive_bytes() -> int:
+    raw = os.getenv("OCI_STATE_MAX_BYTES", str(DEFAULT_MAX_STATE_ARCHIVE_BYTES))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("OCI_STATE_MAX_BYTES must be an integer.") from exc
+    if value <= 0:
+        raise ValueError("OCI_STATE_MAX_BYTES must be greater than zero.")
+    return value
+
+
+def _enforce_state_archive_size(size: int, label: str) -> None:
+    max_bytes = _max_state_archive_bytes()
+    if size > max_bytes:
+        raise ValueError(f"{label} is too large: {size} bytes exceeds {max_bytes}.")
+
+
 def _upload_state(
     client,
     namespace: str,
@@ -355,6 +418,7 @@ def _upload_state(
     archive: bytes,
     kms_key_id: str | None,
 ) -> None:
+    _enforce_state_archive_size(len(archive), "Generated state archive")
     kwargs: dict[str, Any] = {"content_type": _state_content_type(object_name)}
     if kms_key_id:
         kwargs["opc_sse_kms_key_id"] = kms_key_id
@@ -372,6 +436,8 @@ def _update_load_balancers(config: CertbotConfig) -> dict[str, Any]:
     if not config.load_balancer_ids:
         return {"enabled": False}
 
+    # OCI LB certificate bundle names are immutable; publish a fingerprinted
+    # bundle and repoint listeners rather than trying to overwrite in place.
     bundle = _load_certificate_bundle(config)
     certificate_name = _load_balancer_certificate_name(config, bundle)
     client = _load_balancer_client(config)
@@ -776,6 +842,7 @@ def _renew_command(config: CertbotConfig) -> list[str]:
 
 def _run_certbot(args: list[str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
     redacted_command = _redact_command(args)
+    sensitive_values = _sensitive_values_from_args(args)
     print(json.dumps({"event": "certbot_start", "command": redacted_command}))
     try:
         result = subprocess.run(
@@ -796,13 +863,15 @@ def _run_certbot(args: list[str], timeout_seconds: int) -> subprocess.CompletedP
             redacted_command,
             output,
             _latest_certbot_log_tail(),
+            sensitive_values,
         ) from exc
+    redacted_output_tail = _tail(_redact_text(result.stdout, sensitive_values))
     print(
         json.dumps(
             {
                 "event": "certbot_finish",
                 "exitCode": result.returncode,
-                "outputTail": _tail(result.stdout),
+                "outputTail": redacted_output_tail,
             }
         )
     )
@@ -812,6 +881,7 @@ def _run_certbot(args: list[str], timeout_seconds: int) -> subprocess.CompletedP
             redacted_command,
             result.stdout,
             _latest_certbot_log_tail(),
+            sensitive_values,
         )
     return result
 
@@ -824,6 +894,7 @@ def _build_state_archive(object_name: str) -> bytes:
 
 def _build_state_zip_archive() -> bytes:
     buffer = io.BytesIO()
+    total_size = 0
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
         _zip_directory_entry(archive, "certbot-state/")
         for path in sorted(STATE_ROOT.rglob("*")):
@@ -831,10 +902,14 @@ def _build_state_zip_archive() -> bytes:
             if _skip_state_path(path):
                 continue
             if path.is_symlink():
+                total_size += len(os.readlink(path).encode("utf-8"))
+                _enforce_state_archive_size(total_size, "Generated uncompressed state archive")
                 _zip_symlink_entry(archive, path, arcname)
             elif path.is_dir():
                 _zip_directory_entry(archive, f"{arcname}/")
             elif path.is_file():
+                total_size += path.stat().st_size
+                _enforce_state_archive_size(total_size, "Generated uncompressed state archive")
                 archive.write(path, arcname)
     return buffer.getvalue()
 
@@ -878,6 +953,9 @@ def _tar_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
 
 def _extract_state_zip(payload: bytes) -> None:
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        # Object Storage is trusted by IAM, but the archive content still needs
+        # normal path traversal and size checks before extraction.
+        _validate_zip_archive(archive)
         names = [name for name in archive.namelist() if name and name != "/"]
         has_root_directory = any(name == "certbot-state/" for name in names) or all(
             name == "certbot-state" or name.startswith("certbot-state/") for name in names
@@ -885,6 +963,16 @@ def _extract_state_zip(payload: bytes) -> None:
         destination = STATE_ROOT.parent if has_root_directory else STATE_ROOT
         for info in archive.infolist():
             _extract_zip_member(archive, info, destination, STATE_ROOT)
+
+
+def _validate_zip_archive(archive: zipfile.ZipFile) -> None:
+    total_size = 0
+    for info in archive.infolist():
+        _validate_archive_member_name(info.filename)
+        if info.flag_bits & 0x1:
+            raise ValueError(f"Encrypted zip entries are not supported: {info.filename}")
+        total_size += info.file_size
+        _enforce_state_archive_size(total_size, "Uncompressed zip state archive")
 
 
 def _extract_zip_member(
@@ -896,8 +984,7 @@ def _extract_zip_member(
     name = info.filename
     if not name or name == "/":
         return
-    if Path(name).is_absolute():
-        raise ValueError(f"Refusing to extract absolute zip path: {name}")
+    _validate_archive_member_name(name)
 
     target = (destination / name).resolve()
     _assert_under(allowed_root.resolve(), target, name)
@@ -928,16 +1015,36 @@ def _extract_zip_member(
 
 def _safe_extract(archive: tarfile.TarFile, destination: Path) -> None:
     destination = destination.resolve()
+    total_size = 0
     for member in archive.getmembers():
+        # Tar archives can contain links or special files; only the Certbot
+        # state file types we expect are allowed through.
+        _validate_archive_member_name(member.name)
+        if member.islnk():
+            raise ValueError(f"Refusing to extract hard link from state archive: {member.name}")
+        if not (member.isdir() or member.isfile() or member.issym()):
+            raise ValueError(f"Refusing to extract special file from state archive: {member.name}")
+        total_size += member.size
+        _enforce_state_archive_size(total_size, "Uncompressed tar state archive")
         target = (destination / member.name).resolve()
         _assert_under(destination, target, member.name)
-        if member.issym() or member.islnk():
+        if member.issym():
             link_target = Path(member.linkname)
             if link_target.is_absolute():
                 raise ValueError(f"Refusing to extract absolute link target: {member.name}")
             resolved_link = (target.parent / link_target).resolve()
             _assert_under(destination, resolved_link, member.name)
     archive.extractall(destination)
+
+
+def _validate_archive_member_name(name: str) -> None:
+    if not name or name == "/":
+        return
+    if "\x00" in name or "\\" in name:
+        raise ValueError(f"Refusing unsafe archive path: {name}")
+    posix_path = PurePosixPath(name)
+    if posix_path.is_absolute() or ".." in posix_path.parts:
+        raise ValueError(f"Refusing unsafe archive path: {name}")
 
 
 def _assert_under(root: Path, target: Path, name: str) -> None:
@@ -1173,10 +1280,16 @@ def _acme_server_setting(invocation: dict[str, Any]) -> str | None:
     if value is None:
         value = invocation.get("acmeServer")
     if value is None:
+        value = invocation.get("ca")
+    if value is None:
         value = os.getenv("SECTIGO_ACME_SERVER", DEFAULT_SECTIGO_ACME_SERVER)
     if isinstance(value, str):
         value = value.strip()
-    return value or None
+    return _normalize_acme_server(value) if value else None
+
+
+def _normalize_acme_server(value: str) -> str:
+    return ACME_SERVER_ALIASES.get(value.strip().lower(), value)
 
 
 def _eab_kid_setting(invocation: dict[str, Any]) -> str | None:
@@ -1300,15 +1413,60 @@ def _domains(raw: str | None) -> list[str]:
 def _redact_command(args: list[str]) -> list[str]:
     redacted: list[str] = []
     redact_next = False
-    secret_options = {"--eab-hmac-key"}
+    sensitive_values = _sensitive_values_from_args(args)
     for arg in args:
         if redact_next:
             redacted.append("***")
             redact_next = False
             continue
-        redacted.append("***" if arg.startswith("--eab-hmac-key=") else arg)
-        if arg in secret_options:
+        if _is_secret_assignment(arg):
+            redacted.append(_redact_secret_assignment(arg))
+        else:
+            redacted.append(_redact_text(arg, sensitive_values))
+        if arg in SECRET_ARG_OPTIONS:
             redact_next = True
+    return redacted
+
+
+def _sensitive_values_from_args(args: list[str]) -> list[str]:
+    values = []
+    capture_next = False
+    for arg in args:
+        if capture_next:
+            if arg:
+                values.append(arg)
+            capture_next = False
+            continue
+        for option in SECRET_ARG_OPTIONS:
+            prefix = f"{option}="
+            if arg.startswith(prefix):
+                value = arg[len(prefix) :]
+                if value:
+                    values.append(value)
+                break
+        if arg in SECRET_ARG_OPTIONS:
+            capture_next = True
+    return values
+
+
+def _is_secret_assignment(arg: str) -> bool:
+    return any(arg.startswith(f"{option}=") for option in SECRET_ARG_OPTIONS)
+
+
+def _redact_secret_assignment(arg: str) -> str:
+    for option in SECRET_ARG_OPTIONS:
+        if arg.startswith(f"{option}="):
+            return f"{option}=***"
+    return arg
+
+
+def _redact_text(text: str | None, sensitive_values: list[str]) -> str:
+    if not text:
+        return ""
+    redacted = text
+    for value in sensitive_values:
+        if value:
+            redacted = redacted.replace(value, "***")
     return redacted
 
 

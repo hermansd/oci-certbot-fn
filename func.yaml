@@ -1,6 +1,11 @@
+# Copyright (c) 2026, Oracle OCI Certbot contributors
+# Licensed under the Universal Permissive License v 1.0 as shown at
+# https://oss.oracle.com/licenses/upl/
+# SPDX-License-Identifier: UPL-1.0
+
 schema_version: 20180708
-name: sectigo-certbot-renewal
-version: 0.0.13
+name: certbot-renewal
+version: 0.0.15
 runtime: docker
 memory: 512
 timeout: 300

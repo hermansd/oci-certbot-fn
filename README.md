@@ -1,8 +1,14 @@
-# Sectigo Certbot Renewal on OCI Functions
+# Certbot Renewal on OCI Functions
 
 This project is an OCI Function that runs Certbot against a Sectigo ACME endpoint and persists Certbot state in Oracle Object Storage between invocations.
 
-The state archive is a zip file named from the requested domain, for example `www.scott-herman.com.zip`. It contains the Certbot account, renewal configuration, certificates, and private keys from the function's ephemeral `/tmp/certbot-state` directory. Treat the Object Storage bucket as sensitive secret storage.
+## Project Metadata
+
+- Language: Python 3.11 on OCI Functions.
+- License: Universal Permissive License v 1.0 (`UPL-1.0`). See `LICENSE.txt`.
+- SPDX identifier: `UPL-1.0`.
+
+The state archive is a zip file named from the requested domain, for example `www.example.com.zip`. It contains the Certbot account, renewal configuration, certificates, and private keys from the function's ephemeral `/tmp/certbot-state` directory. Treat the Object Storage bucket as sensitive secret storage.
 
 ## Files
 
@@ -26,7 +32,7 @@ The normal invocation payload supplies the bucket and domain:
 ```json
 {
   "bucketName": "sslcerts",
-  "domain": "www.scott-herman.com",
+  "domain": "www.example.com",
   "server": "https://acme.sectigo.com/v2/DV",
   "eabKid": "<sectigo-eab-kid>",
   "eabHmacKey": "<sectigo-eab-hmac-key>",
@@ -35,7 +41,20 @@ The normal invocation payload supplies the bucket and domain:
 }
 ```
 
-With that payload, the function downloads `www.scott-herman.com.zip` from the `sslcerts` bucket. After Certbot completes, it zips `/tmp/certbot-state` and writes the updated archive back to the same object.
+With that payload, the function downloads `www.example.com.zip` from the `sslcerts` bucket. After Certbot completes, it zips `/tmp/certbot-state` and writes the updated archive back to the same object.
+
+For Let’s Encrypt, use either the full ACME directory URL or one of the built-in aliases:
+
+```json
+{
+  "bucketName": "sslcerts",
+  "domain": "www.example.com",
+  "server": "letsencrypt",
+  "email": "admin@example.com"
+}
+```
+
+Supported server aliases are `sectigo`, `sectigo-dv`, `letsencrypt`, `le`, `letsencrypt-staging`, and `le-staging`.
 
 The restore step accepts either zip layout:
 
@@ -50,7 +69,7 @@ After restore, the function repairs imported Certbot state so it can run inside 
 For the payload above, the initial Certbot command is built as:
 
 ```sh
-certbot certonly --standalone --non-interactive --agree-tos --server https://acme.sectigo.com/v2/DV --domain www.scott-herman.com --work-dir certTemp/work --config-dir certTemp/config --logs-dir certTemp/logs
+certbot certonly --standalone --non-interactive --agree-tos --server https://acme.sectigo.com/v2/DV --domain www.example.com --work-dir certTemp/work --config-dir certTemp/config --logs-dir certTemp/logs
 ```
 
 The command runs with `/tmp/certbot-state` as its working directory, so the relative `certTemp/...` paths are included in the zip archive that is written back to Object Storage.
@@ -69,14 +88,15 @@ Provide these as invocation values or OCI Function config values:
 | --- | --- |
 | `OCI_BUCKET_NAME` | Bucket that stores the Certbot state archive. Usually supplied as `bucketName` in the invocation payload. |
 | `CERTBOT_DOMAIN` | Single certificate domain. Usually supplied as `domain` in the invocation payload. |
-| `server` | Sectigo ACME directory URL supplied in the invocation payload. Defaults to `https://acme.sectigo.com/v2/DV`. |
+| `server` | ACME directory URL or alias supplied in the invocation payload. Defaults to `https://acme.sectigo.com/v2/DV`. |
+| `ca` | Alias for `server`. |
 | `OCI_STATE_OBJECT_NAME` | Optional object name override. Defaults to `<domain>.zip`. |
-| `SECTIGO_ACME_SERVER` | Optional Sectigo ACME directory URL. Defaults to `https://acme.sectigo.com/v2/DV`. |
+| `SECTIGO_ACME_SERVER` | Function config fallback for the ACME directory URL. Defaults to `https://acme.sectigo.com/v2/DV`. |
 | `eabKid` | Sectigo ACME External Account Binding key identifier supplied in the invocation payload. |
 | `eabHmacKey` | Sectigo ACME External Account Binding HMAC key supplied in the invocation payload. |
 | `SECTIGO_EAB_KID` | Function config fallback for `eabKid`. |
 | `SECTIGO_EAB_HMAC_KEY` | Function config fallback for `eabHmacKey`. |
-| `SECTIGO_EAB_REQUIRED` | Set to `false` only if your ACME server does not require EAB. Defaults to `true` for Sectigo URLs. |
+| `SECTIGO_EAB_REQUIRED` | Set to `false` only if your ACME server does not require EAB. Defaults to `true` for Sectigo URLs and `false` for Let’s Encrypt. |
 | `CERTBOT_EMAIL` | Optional email used for Certbot registration and expiry notices. |
 | `CERTBOT_DOMAINS` | Optional comma-separated certificate names, for example `example.com,*.example.com`. If omitted, the invocation `domain` is used. |
 | `CERTBOT_EXTRA_ARGS` | Certbot challenge/plugin args. Defaults to `--standalone`. See the OCI DNS example below. |
@@ -87,6 +107,7 @@ Optional values:
 | --- | --- |
 | `OCI_NAMESPACE` | Object Storage namespace. If omitted, the function calls `get_namespace`. |
 | `OCI_OBJECT_STORAGE_KMS_KEY_ID` | Vault key OCID for server-side encryption of the state archive. |
+| `OCI_STATE_MAX_BYTES` | Maximum state archive size, including uncompressed zip/tar contents. Defaults to `52428800`. |
 | `OCI_REGION` | Region override. Usually unnecessary in OCI Functions. |
 | `OCI_AUTH_MODE` | `resource_principal` by default. Also supports `instance_principal` and `config_file` for local testing. |
 | `CERTBOT_CERT_NAME` | Stable Certbot lineage name for initial issuance. |
@@ -192,7 +213,7 @@ fn invoke <app-name> sectigo-certbot-renewal
 Or invoke with the bucket/domain payload:
 
 ```sh
-echo '{"bucketName":"sslcerts","domain":"www.scott-herman.com","server":"https://acme.sectigo.com/v2/DV","eabKid":"<sectigo-eab-kid>","eabHmacKey":"<sectigo-eab-hmac-key>","loadBalancerOcid":"<load-balancer-ocid>","forceRenewal":true}' | fn invoke <app-name> sectigo-certbot-renewal
+echo '{"bucketName":"sslcerts","domain":"www.example.com","server":"https://acme.sectigo.com/v2/DV","eabKid":"<sectigo-eab-kid>","eabHmacKey":"<sectigo-eab-hmac-key>","loadBalancerOcid":"<load-balancer-ocid>","forceRenewal":true}' | fn invoke <app-name> sectigo-certbot-renewal
 ```
 
 For scheduled renewal, create an OCI Events rule or scheduled job that invokes the function daily and passes the same bucket/domain payload, or set `OCI_BUCKET_NAME` and `CERTBOT_DOMAIN` as function config values. Certbot exits successfully without replacing certificates until they are due, so daily invocation is safe.
@@ -200,8 +221,10 @@ For scheduled renewal, create an OCI Events rule or scheduled job that invokes t
 ## Security Notes
 
 - The state archive contains private keys. Restrict bucket access, enable Object Storage retention/versioning as appropriate, and prefer a Vault KMS key.
+- The function rejects state archive paths that traverse outside `/tmp/certbot-state`, rejects special files/hard links, and enforces `OCI_STATE_MAX_BYTES`.
 - Put the function in a subnet with outbound internet access to reach the Sectigo ACME endpoint and DNS APIs.
 - Store Sectigo EAB values as function config only where access is tightly controlled.
+- Certbot command output and logs redact `--eab-hmac-key` values before returning error details.
 - For production, test once against a non-production certificate profile or limited domain before scheduling unattended renewals.
 
 ## References
@@ -213,3 +236,6 @@ For scheduled renewal, create an OCI Events rule or scheduled job that invokes t
 - OCI Python SDK `UpdateListenerDetails`: https://docs.oracle.com/en-us/iaas/tools/python/latest/api/load_balancer/models/oci.load_balancer.models.UpdateListenerDetails.html
 - OCI Python SDK `SSLConfigurationDetails`: https://docs.oracle.com/en-us/iaas/tools/python/latest/api/load_balancer/models/oci.load_balancer.models.SSLConfigurationDetails.html
 - OCI Load Balancer IAM policy resource types: https://docs.public.content.oci.oraclecloud.com/en-us/iaas/Content/Identity/Reference/lbpolicyreference.htm
+
+## Disclaimer (Sample Code)
+ORACLE AND ITS AFFILIATES DO NOT PROVIDE ANY WARRANTY WHATSOEVER, EXPRESS OR IMPLIED, FOR ANY SOFTWARE, MATERIAL OR CONTENT OF ANY KIND CONTAINED OR PRODUCED WITHIN THIS REPOSITORY, AND IN PARTICULAR SPECIFICALLY DISCLAIM ANY AND ALL IMPLIED WARRANTIES OF TITLE, NON-INFRINGEMENT, MERCHANTABILITY, AND FITNESS FOR A PARTICULAR PURPOSE. FURTHERMORE, ORACLE AND ITS AFFILIATES DO NOT REPRESENT THAT ANY CUSTOMARY SECURITY REVIEW HAS BEEN PERFORMED WITH RESPECT TO ANY SOFTWARE, MATERIAL OR CONTENT CONTAINED OR PRODUCED WITHIN THIS REPOSITORY. IN ADDITION, AND WITHOUT LIMITING THE FOREGOING, THIRD PARTIES MAY HAVE POSTED SOFTWARE, MATERIAL OR CONTENT TO THIS REPOSITORY WITHOUT ANY REVIEW. USE AT YOUR OWN RISK. THIS SAMPLE CODE HAS NOT BEEN THOROUGHLY TESTED FOR ACCESSIBILITY.

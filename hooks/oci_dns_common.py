@@ -1,3 +1,8 @@
+# Copyright (c) 2026, Oracle OCI Certbot contributors
+# Licensed under the Universal Permissive License v 1.0 as shown at
+# https://oss.oracle.com/licenses/upl/
+# SPDX-License-Identifier: UPL-1.0
+
 from __future__ import annotations
 
 import os
