@@ -5,7 +5,7 @@
 
 schema_version: 20180708
 name: certbot-renewal
-version: 0.0.15
+version: 0.0.26
 runtime: docker
 memory: 512
 timeout: 300

@@ -7,7 +7,8 @@ FROM fnproject/python:3.11-dev AS build-stage
 
 WORKDIR /function
 ADD requirements.txt /function/
-RUN pip3 install --target /python --no-cache-dir -r requirements.txt
+RUN pip3 install --target /python --no-cache-dir -r requirements.txt \
+    && PYTHONPATH=/python /python/bin/certbot plugins | grep -q dns-cloudflare
 
 ADD . /function/
 RUN chmod +x /function/hooks/*.py

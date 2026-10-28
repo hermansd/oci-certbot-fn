@@ -22,7 +22,7 @@ The state archive is a zip file named from the requested domain, for example `ww
 
 1. Resolve the bucket from `bucketName` and the state object from `<domain>.zip`.
 2. Extract it into `/tmp/certbot-state`.
-3. If no renewal lineage exists, run `certbot certonly` using the Sectigo ACME server.
+3. If no renewal lineage exists, run `certbot certonly` with the selected provider.
 4. If renewal lineage exists, run `certbot renew`.
 5. Zip the updated `/tmp/certbot-state` directory and overwrite the Object Storage object.
 6. If `OCI_LB_ID` is set, create a versioned OCI Load Balancer certificate bundle from the Certbot PEM files and point the configured listener(s) at it.
@@ -33,26 +33,44 @@ The normal invocation payload supplies the bucket and domain:
 {
   "bucketName": "sslcerts",
   "domain": "www.example.com",
-  "server": "https://acme.sectigo.com/v2/DV",
+  "provider": "sectigo",
   "eabKid": "<sectigo-eab-kid>",
   "eabHmacKey": "<sectigo-eab-hmac-key>",
-  "loadBalancerOcid": "<load-balancer-ocid>",
-  "forceRenewal": true
+  "loadBalancerOcid": "<load-balancer-ocid>"
 }
 ```
 
 With that payload, the function downloads `www.example.com.zip` from the `sslcerts` bucket. After Certbot completes, it zips `/tmp/certbot-state` and writes the updated archive back to the same object.
 
-For Let’s Encrypt, use either the full ACME directory URL or one of the built-in aliases:
+For Cloudflare DNS with Let’s Encrypt, use:
 
 ```json
 {
   "bucketName": "sslcerts",
   "domain": "www.example.com",
-  "server": "letsencrypt",
-  "email": "admin@example.com"
+  "provider": "cloudflare",
+  "cloudflareApiToken": "<zone-scoped-api-token>",
+  "email": "admin@example.com",
+  "loadBalancerOcid": "<load-balancer-ocid>"
 }
 ```
+
+Cloudflare mode uses the Let's Encrypt production ACME server and DNS-01 validation automatically. It writes the token to a mode-0600 file outside the archived state and removes that file after Certbot finishes. Set `CLOUDFLARE_API_TOKEN` as function config instead of passing `cloudflareApiToken` in the payload if preferred. A Cloudflare API token scoped to the zone with DNS edit permission is required. Use `"server": "letsencrypt-staging"` for testing. Keep separate `stateObjectName` values if you issue certificates for the same domain through both providers.
+
+If the state ZIP already contains a Cloudflare credentials INI file, pass its path relative to the ZIP root instead of a token:
+
+```json
+{
+  "bucketName": "sslcerts",
+  "domain": "www.example.com",
+  "provider": "cloudflare",
+  "cloudflareCredentialsPath": "certState/cloudflare/www.example.com.ini",
+  "email": "admin@example.com",
+  "loadBalancerOcid": "<load-balancer-ocid>"
+}
+```
+
+The INI file must contain `dns_cloudflare_api_token = <token>`. The function reads it only from the restored state tree, then writes a temporary mode-0600 copy for Certbot. For compatibility, a `.ini` path supplied as `cloudflareApiToken` is also treated as a state path, but `cloudflareCredentialsPath` makes the intent explicit. The state ZIP itself still contains the source INI and must be protected as a secret. Prefer function config for new setups so the token is not persisted in the state ZIP.
 
 Supported server aliases are `sectigo`, `sectigo-dv`, `letsencrypt`, `le`, `letsencrypt-staging`, and `le-staging`.
 
@@ -88,7 +106,10 @@ Provide these as invocation values or OCI Function config values:
 | --- | --- |
 | `OCI_BUCKET_NAME` | Bucket that stores the Certbot state archive. Usually supplied as `bucketName` in the invocation payload. |
 | `CERTBOT_DOMAIN` | Single certificate domain. Usually supplied as `domain` in the invocation payload. |
-| `server` | ACME directory URL or alias supplied in the invocation payload. Defaults to `https://acme.sectigo.com/v2/DV`. |
+| `provider` | `sectigo` (default, standalone) or `cloudflare` (Let's Encrypt with Cloudflare DNS-01). |
+| `cloudflareApiToken` | Cloudflare DNS API token for Cloudflare mode. `CLOUDFLARE_API_TOKEN` is the function config fallback. |
+| `cloudflareCredentialsPath` | Optional relative path to a Cloudflare token INI file in the restored state ZIP. Overrides `cloudflareApiToken`; `CLOUDFLARE_CREDENTIALS_PATH` is the config fallback. |
+| `server` | Optional ACME directory URL or alias. Defaults to Sectigo DV for Sectigo mode or Let's Encrypt production for Cloudflare mode. |
 | `ca` | Alias for `server`. |
 | `OCI_STATE_OBJECT_NAME` | Optional object name override. Defaults to `<domain>.zip`. |
 | `SECTIGO_ACME_SERVER` | Function config fallback for the ACME directory URL. Defaults to `https://acme.sectigo.com/v2/DV`. |
@@ -99,7 +120,7 @@ Provide these as invocation values or OCI Function config values:
 | `SECTIGO_EAB_REQUIRED` | Set to `false` only if your ACME server does not require EAB. Defaults to `true` for Sectigo URLs and `false` for Let’s Encrypt. |
 | `CERTBOT_EMAIL` | Optional email used for Certbot registration and expiry notices. |
 | `CERTBOT_DOMAINS` | Optional comma-separated certificate names, for example `example.com,*.example.com`. If omitted, the invocation `domain` is used. |
-| `CERTBOT_EXTRA_ARGS` | Certbot challenge/plugin args. Defaults to `--standalone`. See the OCI DNS example below. |
+| `CERTBOT_EXTRA_ARGS` | Optional advanced Certbot args. Not needed for either built-in provider. For Sectigo, supplying an authenticator here replaces `--standalone`. |
 
 Optional values:
 
@@ -188,35 +209,44 @@ Allow dynamic-group <dynamic-group-name> to manage load-balancers in compartment
 
 ## Deploy
 
-Build and deploy with the OCI Functions CLI:
+From this project directory, configure an Fn context for your OCI region and container registry. Replace the example region and placeholder values with your own:
 
 ```sh
-fn deploy --app <app-name>
+fn create context certbot-oci --provider oracle
+fn use context certbot-oci
+fn update context oracle.compartment-id <compartment-ocid>
+fn update context api-url https://functions.us-ashburn-1.oci.oraclecloud.com
+fn update context registry iad.ocir.io/<tenancy-namespace>/<repository-prefix>
 ```
 
-Then set function config. Example:
+Authenticate your container client to OCI Container Registry before deploying. The following commands use the existing OCI Functions application named `certbot`:
 
 ```sh
-fn config function <app-name> sectigo-certbot-renewal OCI_DNS_ZONE_NAME example.com
-fn config function <app-name> sectigo-certbot-renewal CERTBOT_EXTRA_ARGS '--manual --preferred-challenges dns --manual-auth-hook /function/hooks/oci_dns_auth.py --manual-cleanup-hook /function/hooks/oci_dns_cleanup.py --manual-public-ip-logging-ok'
-fn config function <app-name> sectigo-certbot-renewal OCI_LB_ID <load-balancer-ocid>
-fn config function <app-name> sectigo-certbot-renewal OCI_LB_LISTENER_NAMES https
-fn config function <app-name> sectigo-certbot-renewal OCI_LB_CERTIFICATE_NAME_PREFIX example-com
+fn deploy --app certbot
+fn inspect function certbot certbot-renewal
 ```
 
-Invoke manually:
+For Cloudflare mode, set the token as function config so it does not need to be included in each invocation:
 
 ```sh
-fn invoke <app-name> sectigo-certbot-renewal
+fn config function certbot certbot-renewal CLOUDFLARE_API_TOKEN '<zone-scoped-token>'
 ```
 
-Or invoke with the bucket/domain payload:
+Invoke Cloudflare mode:
 
 ```sh
-echo '{"bucketName":"sslcerts","domain":"www.example.com","server":"https://acme.sectigo.com/v2/DV","eabKid":"<sectigo-eab-kid>","eabHmacKey":"<sectigo-eab-hmac-key>","loadBalancerOcid":"<load-balancer-ocid>","forceRenewal":true}' | fn invoke <app-name> sectigo-certbot-renewal
+printf '%s' '{"bucketName":"sslcerts","domain":"www.example.com","provider":"cloudflare","email":"admin@example.com","loadBalancerOcid":"<load-balancer-ocid>"}' | fn invoke certbot certbot-renewal
 ```
 
-For scheduled renewal, create an OCI Events rule or scheduled job that invokes the function daily and passes the same bucket/domain payload, or set `OCI_BUCKET_NAME` and `CERTBOT_DOMAIN` as function config values. Certbot exits successfully without replacing certificates until they are due, so daily invocation is safe.
+For Sectigo mode, configure EAB credentials and invoke with the provider selection:
+
+```sh
+fn config function certbot certbot-renewal SECTIGO_EAB_KID '<sectigo-eab-kid>'
+fn config function certbot certbot-renewal SECTIGO_EAB_HMAC_KEY '<sectigo-eab-hmac-key>'
+printf '%s' '{"bucketName":"sslcerts","domain":"www.example.com","provider":"sectigo","loadBalancerOcid":"<load-balancer-ocid>"}' | fn invoke certbot certbot-renewal
+```
+
+To publish later changes, increase `version` in `func.yaml` and rerun `fn deploy --app certbot`. For scheduled renewal, have the scheduler pass the same JSON body; Certbot will skip certificates that are not due unless `forceRenewal` is true. Use separate `stateObjectName` values when both providers issue the same domain.
 
 ## Security Notes
 
@@ -224,6 +254,7 @@ For scheduled renewal, create an OCI Events rule or scheduled job that invokes t
 - The function rejects state archive paths that traverse outside `/tmp/certbot-state`, rejects special files/hard links, and enforces `OCI_STATE_MAX_BYTES`.
 - Put the function in a subnet with outbound internet access to reach the Sectigo ACME endpoint and DNS APIs.
 - Store Sectigo EAB values as function config only where access is tightly controlled.
+- Prefer `CLOUDFLARE_API_TOKEN` function config over sending a token in each invocation; the temporary Cloudflare credentials file is excluded from Object Storage.
 - Certbot command output and logs redact `--eab-hmac-key` values before returning error details.
 - For production, test once against a non-production certificate profile or limited domain before scheduling unattended renewals.
 

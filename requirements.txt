@@ -3,6 +3,7 @@
 # https://oss.oracle.com/licenses/upl/
 # SPDX-License-Identifier: UPL-1.0
 
-certbot
-fdk
-oci
+certbot==5.8.0
+certbot-dns-cloudflare==5.8.0
+fdk==0.1.128
+oci==2.189.0

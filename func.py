@@ -17,6 +17,7 @@ import sys
 import tarfile
 import traceback
 import zipfile
+from configparser import ConfigParser, Error as ConfigParserError
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from stat import S_IFDIR, S_IFLNK, S_IFREG
@@ -44,6 +45,7 @@ LOGS_DIR = CERT_TEMP_DIR / "logs"
 CONFIG_DIR_ARG = "certTemp/config"
 WORK_DIR_ARG = "certTemp/work"
 LOGS_DIR_ARG = "certTemp/logs"
+CLOUDFLARE_CREDENTIALS = Path("/tmp/certbot-secrets/cloudflare.ini")
 DEFAULT_SECTIGO_ACME_SERVER = "https://acme.sectigo.com/v2/DV"
 LETSENCRYPT_ACME_SERVER = "https://acme-v02.api.letsencrypt.org/directory"
 LETSENCRYPT_STAGING_ACME_SERVER = "https://acme-staging-v02.api.letsencrypt.org/directory"
@@ -65,6 +67,9 @@ SECRET_ARG_OPTIONS = {"--eab-hmac-key"}
 class CertbotConfig:
     bucket_name: str
     domain: str | None
+    provider: str
+    cloudflare_api_token: str | None
+    cloudflare_credentials_path: str | None
     namespace: str | None
     state_object_name: str
     kms_key_id: str | None
@@ -179,8 +184,20 @@ def run(invocation: dict[str, Any] | None = None) -> dict[str, Any]:
         mode = "renew"
         certbot_args = _renew_command(config)
 
-    certbot_result = _run_certbot(certbot_args, config.timeout_seconds)
+    try:
+        cloudflare_token = _prepare_cloudflare_credentials(config)
+        certbot_result = _run_certbot(
+            certbot_args,
+            config.timeout_seconds,
+            [cloudflare_token] if cloudflare_token else [],
+        )
+    finally:
+        CLOUDFLARE_CREDENTIALS.unlink(missing_ok=True)
     certbot_sensitive_values = _sensitive_values_from_args(certbot_args)
+    if config.cloudflare_api_token:
+        certbot_sensitive_values.append(config.cloudflare_api_token)
+    if config.provider == "cloudflare":
+        certbot_sensitive_values.append(cloudflare_token)
     archive = _build_state_archive(config.state_object_name)
     _upload_state(
         object_storage,
@@ -212,24 +229,41 @@ def _load_config(invocation: dict[str, Any]) -> CertbotConfig:
         raise ValueError("bucketName in the invocation payload or OCI_BUCKET_NAME is required.")
 
     domain = _setting(invocation, "domain", "CERTBOT_DOMAIN")
+    provider = (_setting(invocation, "provider", "CERTBOT_PROVIDER", "sectigo") or "sectigo").lower()
+    if provider not in {"sectigo", "cloudflare"}:
+        raise ValueError("provider must be 'sectigo' or 'cloudflare'.")
+    server = _acme_server_setting(invocation, provider)
+    if provider == "cloudflare" and server not in {
+        LETSENCRYPT_ACME_SERVER, LETSENCRYPT_STAGING_ACME_SERVER
+    }:
+        raise ValueError("Cloudflare mode supports the Let's Encrypt production or staging server.")
 
     return CertbotConfig(
         bucket_name=bucket_name,
         domain=domain,
+        provider=provider,
+        cloudflare_api_token=_setting(invocation, "cloudflareApiToken", "CLOUDFLARE_API_TOKEN"),
+        cloudflare_credentials_path=_setting(
+            invocation, "cloudflareCredentialsPath", "CLOUDFLARE_CREDENTIALS_PATH"
+        ),
         namespace=_setting(invocation, "namespace", "OCI_NAMESPACE"),
         state_object_name=_state_object_name(
             invocation,
             domain,
         ),
         kms_key_id=_setting(invocation, "kmsKeyId", "OCI_OBJECT_STORAGE_KMS_KEY_ID"),
-        acme_server=_acme_server_setting(invocation),
-        eab_kid=_eab_kid_setting(invocation),
-        eab_hmac_key=_eab_hmac_key_setting(invocation),
-        eab_required=_bool_setting(
-            invocation,
-            "eabRequired",
-            "SECTIGO_EAB_REQUIRED",
-            _default_eab_required(_acme_server_setting(invocation)),
+        acme_server=server,
+        eab_kid=_eab_kid_setting(invocation) if provider == "sectigo" else None,
+        eab_hmac_key=_eab_hmac_key_setting(invocation) if provider == "sectigo" else None,
+        eab_required=(
+            _bool_setting(
+                invocation,
+                "eabRequired",
+                "SECTIGO_EAB_REQUIRED",
+                _default_eab_required(server),
+            )
+            if provider == "sectigo"
+            else False
         ),
         email=_setting(invocation, "email", "CERTBOT_EMAIL"),
         domains=_configured_domains(invocation, domain),
@@ -238,7 +272,7 @@ def _load_config(invocation: dict[str, Any]) -> CertbotConfig:
             invocation,
             "extraArgs",
             "CERTBOT_EXTRA_ARGS",
-            "--standalone",
+            "",
         ),
         issue_args=_arg_setting(invocation, "issueArgs", "CERTBOT_ISSUE_ARGS"),
         renew_args=_arg_setting(invocation, "renewArgs", "CERTBOT_RENEW_ARGS"),
@@ -298,11 +332,89 @@ def _validate_initial_issue_config(config: CertbotConfig) -> None:
         missing.append("eabKid or SECTIGO_EAB_KID")
     if config.eab_required and not config.eab_hmac_key:
         missing.append("eabHmacKey or SECTIGO_EAB_HMAC_KEY")
+    if config.provider == "cloudflare" and not (
+        config.cloudflare_api_token or config.cloudflare_credentials_path
+    ):
+        missing.append("cloudflareCredentialsPath, cloudflareApiToken, or CLOUDFLARE_API_TOKEN")
     if missing:
         raise ValueError(
             "Initial certificate issuance is missing required config: "
             + ", ".join(missing)
         )
+
+
+def _authenticator_args(config: CertbotConfig) -> list[str]:
+    if config.provider == "cloudflare":
+        return [
+            "--dns-cloudflare",
+            "--dns-cloudflare-credentials",
+            str(CLOUDFLARE_CREDENTIALS),
+        ]
+    if config.extra_args:
+        return []
+    return ["--standalone"]
+
+
+def _prepare_cloudflare_credentials(config: CertbotConfig) -> str | None:
+    if config.provider != "cloudflare":
+        return None
+    credentials_path = config.cloudflare_credentials_path
+    if not credentials_path and config.cloudflare_api_token and config.cloudflare_api_token.endswith(".ini"):
+        # Accept older invocations that put a state-archive path in the token field.
+        credentials_path = config.cloudflare_api_token
+    token = (
+        _cloudflare_token_from_state(credentials_path)
+        if credentials_path
+        else config.cloudflare_api_token
+    )
+    if not token:
+        raise ValueError(
+            "Cloudflare mode requires cloudflareCredentialsPath, cloudflareApiToken, "
+            "or CLOUDFLARE_API_TOKEN."
+        )
+    if any(character.isspace() for character in token):
+        raise ValueError("Cloudflare API token must not contain whitespace.")
+
+    # Keep the token outside the archived state; Certbot persists only this path.
+    CLOUDFLARE_CREDENTIALS.parent.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(CLOUDFLARE_CREDENTIALS.parent, 0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(CLOUDFLARE_CREDENTIALS, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as credentials:
+            credentials.write(f"dns_cloudflare_api_token = {token}\n")
+    except BaseException:
+        CLOUDFLARE_CREDENTIALS.unlink(missing_ok=True)
+        raise
+    return token
+
+
+def _cloudflare_token_from_state(relative_path: str) -> str:
+    path = PurePosixPath(relative_path)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or "\\" in relative_path
+        or path.suffix != ".ini"
+    ):
+        raise ValueError("cloudflareCredentialsPath must be a relative .ini path in the state archive.")
+    source = STATE_ROOT.joinpath(*path.parts)
+    resolved = source.resolve()
+    _assert_under(STATE_ROOT.resolve(), resolved, relative_path)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("Cloudflare credentials file was not found in the state archive.")
+    if source.stat().st_size > 8192:
+        raise ValueError("Cloudflare credentials file exceeds 8192 bytes.")
+    parser = ConfigParser(interpolation=None)
+    try:
+        parser.read_string("[credentials]\n" + source.read_text(encoding="utf-8"))
+    except (ConfigParserError, UnicodeError):
+        raise ValueError("Cloudflare credentials file is not valid UTF-8 INI data.") from None
+    token = parser.get("credentials", "dns_cloudflare_api_token", fallback="").strip()
+    if not token:
+        raise ValueError("Cloudflare credentials file must contain dns_cloudflare_api_token.")
+    return token
 
 
 def _object_storage_client(config: CertbotConfig):
@@ -796,6 +908,7 @@ def _issue_command(config: CertbotConfig) -> list[str]:
     args = [
         *config.certbot_command,
         "certonly",
+        *_authenticator_args(config),
         *config.extra_args,
         "--non-interactive",
         "--agree-tos",
@@ -826,6 +939,7 @@ def _renew_command(config: CertbotConfig) -> list[str]:
     args = [
         *config.certbot_command,
         "renew",
+        *_authenticator_args(config),
         *config.extra_args,
         "--non-interactive",
         "--work-dir",
@@ -840,9 +954,13 @@ def _renew_command(config: CertbotConfig) -> list[str]:
     return [*args, *config.renew_args]
 
 
-def _run_certbot(args: list[str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
-    redacted_command = _redact_command(args)
-    sensitive_values = _sensitive_values_from_args(args)
+def _run_certbot(
+    args: list[str], timeout_seconds: int, extra_sensitive_values: list[str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    sensitive_values = _sensitive_values_from_args(args) + (extra_sensitive_values or [])
+    redacted_command = [
+        _redact_text(arg, extra_sensitive_values or []) for arg in _redact_command(args)
+    ]
     print(json.dumps({"event": "certbot_start", "command": redacted_command}))
     try:
         result = subprocess.run(
@@ -1275,14 +1393,16 @@ def _state_object_name(invocation: dict[str, Any], domain: str | None) -> str:
     )
 
 
-def _acme_server_setting(invocation: dict[str, Any]) -> str | None:
+def _acme_server_setting(invocation: dict[str, Any], provider: str = "sectigo") -> str | None:
     value = invocation.get("server")
     if value is None:
         value = invocation.get("acmeServer")
     if value is None:
         value = invocation.get("ca")
+    if value is None and provider == "sectigo":
+        value = os.getenv("SECTIGO_ACME_SERVER")
     if value is None:
-        value = os.getenv("SECTIGO_ACME_SERVER", DEFAULT_SECTIGO_ACME_SERVER)
+        value = "letsencrypt" if provider == "cloudflare" else DEFAULT_SECTIGO_ACME_SERVER
     if isinstance(value, str):
         value = value.strip()
     return _normalize_acme_server(value) if value else None
